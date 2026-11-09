@@ -4,14 +4,16 @@ import io
 import logging
 import random
 import re
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import TypeVar
 
 import qrcode
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ChatAction
 from aiogram.types import BufferedInputFile, Message
 from telethon import TelegramClient, events
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import ChatWriteForbiddenError, SessionPasswordNeededError
 
 from .config import Settings
 from .group_actions import (
@@ -30,6 +32,7 @@ from .speech import PiperSpeaker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+ActionResult = TypeVar("ActionResult", str, bytes)
 VOICE_REQUEST_PATTERN = re.compile(
     r"\b(?:ответь|скажи|пришли|отправь|скинь|запиши|озвучь|прочитай)\b"
     r".{0,40}\b(?:голосом|голосовое(?:\s+сообщение)?|голосовым(?:\s+сообщением)?|гс)\b"
@@ -216,7 +219,6 @@ async def run_bot_api(
                 await bot.send_voice(
                     message.chat.id,
                     BufferedInputFile(audio, filename="nikita.ogg"),
-                    caption=answer,
                 )
             except Exception:
                 logger.exception("Не удалось создать голосовой ответ")
@@ -366,11 +368,15 @@ async def run_user_session(
                             image_prompt=True,
                         )
                     await model.unload()
-                    async with client.action(chat_id, "photo"):
-                        image_bytes = await asyncio.to_thread(
+                    image_bytes = await run_with_telethon_action(
+                        client,
+                        chat_id,
+                        "photo",
+                        lambda: asyncio.to_thread(
                             image_generator.generate,
                             english_prompt,
-                        )
+                        ),
+                    )
                     memory.add(
                         chat_id,
                         "user",
@@ -379,7 +385,7 @@ async def run_user_session(
                     memory.add(chat_id, "assistant", "Создал изображение.")
                     await client.send_file(
                         chat_id,
-                        image_bytes,
+                        telethon_image_file(image_bytes),
                         force_document=False,
                         caption="Готово.",
                         reply_to=event.message.id,
@@ -416,8 +422,11 @@ async def run_user_session(
             elif not text:
                 return
 
-            async with client.action(chat_id, "typing"):
-                answer = await generate_answer(
+            answer = await run_with_telethon_action(
+                client,
+                chat_id,
+                "typing",
+                lambda: generate_answer(
                     chat_id,
                     format_sender_context(sender, text)
                     if event.is_group or sender_is_bot
@@ -426,15 +435,15 @@ async def run_user_session(
                     model,
                     memory,
                     voice_reply=voice_requested,
-                )
+                ),
+            )
             if voice_requested:
                 try:
                     audio = await asyncio.to_thread(speaker.synthesize_ogg, answer)
                     await client.send_file(
                         chat_id,
-                        audio,
+                        telethon_voice_file(audio),
                         voice_note=True,
-                        caption=answer,
                         reply_to=event.message.id,
                     )
                 except Exception:
@@ -568,7 +577,6 @@ async def send_bot_proactive(
         await bot.send_voice(
             chat_id,
             BufferedInputFile(content, filename="nikita.ogg"),
-            caption=caption,
         )
     else:
         await bot.send_message(chat_id, content)
@@ -581,9 +589,17 @@ async def send_telethon_proactive(
 ) -> None:
     kind, content, caption = proactive
     if kind == "image":
-        await client.send_file(chat_id, content)
+        if not isinstance(content, bytes):
+            raise TypeError("Для изображения ожидаются байты")
+        await client.send_file(chat_id, telethon_image_file(content))
     elif kind == "voice":
-        await client.send_file(chat_id, content, voice_note=True, caption=caption)
+        if not isinstance(content, bytes):
+            raise TypeError("Для голосового сообщения ожидаются байты")
+        await client.send_file(
+            chat_id,
+            telethon_voice_file(content),
+            voice_note=True,
+        )
     else:
         await client.send_message(chat_id, content)
 
@@ -606,11 +622,42 @@ async def generate_answer(
     return answer
 
 
+async def run_with_telethon_action(
+    client: TelegramClient,
+    chat_id: int,
+    action: str,
+    operation: Callable[[], Awaitable[ActionResult]],
+) -> ActionResult:
+    result: ActionResult | None = None
+    try:
+        async with client.action(chat_id, action):
+            result = await operation()
+    except ChatWriteForbiddenError:
+        logger.info("Не удалось показать действие %r в чате %s", action, chat_id)
+        if result is None:
+            return await operation()
+
+    assert result is not None
+    return result
+
+
 def parse_voice_command(text: str) -> tuple[bool, str]:
     parts = text.split(maxsplit=1)
     if not parts or parts[0].split("@", 1)[0].casefold() != "/voice":
         return False, text
     return True, parts[1].strip() if len(parts) > 1 else ""
+
+
+def telethon_image_file(image_bytes: bytes) -> io.BytesIO:
+    image_file = io.BytesIO(image_bytes)
+    image_file.name = "nikita.png"
+    return image_file
+
+
+def telethon_voice_file(audio_bytes: bytes) -> io.BytesIO:
+    audio_file = io.BytesIO(audio_bytes)
+    audio_file.name = "nikita.ogg"
+    return audio_file
 
 
 def format_sender_context(sender: object, text: str) -> str:
@@ -632,7 +679,8 @@ def wants_voice_reply(text: str) -> bool:
 
 
 IMAGE_REQUEST_PATTERN = re.compile(
-    r"^\s*(?:нарисуй|сгенерируй|создай|сделай)\s+"
+    r"^\s*(?:(?:никита|никит|некит)\b\s*[,!:—-]?\s*)?"
+    r"(?:нарисуй|сгенерируй|создай|сделай)\s+"
     r"(?:(?:мне|пожалуйста)\s+)*"
     r"(?:(?:картинку|изображение|иллюстрацию|арт|фото)\b\s*)?"
     r"(.*)$",

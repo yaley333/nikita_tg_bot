@@ -52,7 +52,7 @@ class Settings:
             ).lower()
             in {"1", "true", "yes", "on"},
             group_reply_probability=min(
-                1.0, max(0.0, float(os.getenv("GROUP_REPLY_PROBABILITY", "0.7")))
+                1.0, max(0.0, float(os.getenv("GROUP_REPLY_PROBABILITY", "1.0")))
             ),
             proactive_group_enabled=os.getenv("PROACTIVE_GROUP_ENABLED", "true").lower()
             in {"1", "true", "yes", "on"},

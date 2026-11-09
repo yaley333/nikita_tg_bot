@@ -1,10 +1,12 @@
 import os
 from io import BytesIO
 import unittest
-from unittest.mock import patch
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 
 from PIL import Image
+from telethon.errors import ChatWriteForbiddenError
+from telethon import utils as telethon_utils
 
 from nikita_bot.config import Settings
 from nikita_bot.group_actions import (
@@ -20,7 +22,10 @@ from nikita_bot.main import (
     format_sender_context,
     parse_image_request,
     parse_voice_command,
+    run_with_telethon_action,
     should_respond_to_group_message,
+    telethon_image_file,
+    telethon_voice_file,
     wants_voice_reply,
 )
 from nikita_bot.memory import ConversationMemory
@@ -33,6 +38,8 @@ from nikita_bot.model import (
 )
 from nikita_bot.persona import SYSTEM_PROMPT
 from nikita_bot.speech import clean_text_for_speech
+
+
 class ConversationMemoryTests(unittest.TestCase):
     def test_bot_mode_does_not_need_telethon_credentials(self) -> None:
         with patch("nikita_bot.config.load_dotenv"), patch.dict(
@@ -44,6 +51,7 @@ class ConversationMemoryTests(unittest.TestCase):
         self.assertIsNone(settings.telegram_bot_token)
         self.assertIsNone(settings.api_id)
         self.assertIsNone(settings.api_hash)
+        self.assertEqual(settings.group_reply_probability, 1.0)
         self.assertEqual(settings.session_path, ".sessions/nikita_user")
         self.assertEqual(
             settings.piper_voice_path,
@@ -119,6 +127,17 @@ class ConversationMemoryTests(unittest.TestCase):
         self.assertFalse(should_respond_to_group_message(True, True, 0.7, 0.71))
         self.assertFalse(should_respond_to_group_message(True, False, 0.7, 0.1))
         self.assertTrue(should_respond_to_group_message(False, False, 0.7, 0.1))
+        self.assertTrue(should_respond_to_group_message(False, False, 1.0, 0.999))
+
+    def test_group_reply_probability_can_be_set_explicitly(self) -> None:
+        with patch("nikita_bot.config.load_dotenv"), patch.dict(
+            os.environ,
+            {"TELEGRAM_MODE": "user", "GROUP_REPLY_PROBABILITY": "0.4"},
+            clear=True,
+        ):
+            settings = Settings.from_env()
+
+        self.assertEqual(settings.group_reply_probability, 0.4)
 
     def test_group_initiative_waits_for_activity_and_respects_cooldown(self) -> None:
         initiative = GroupInitiative(min_messages=2, chance=0.5, cooldown_seconds=60)
@@ -182,10 +201,40 @@ class ConversationMemoryTests(unittest.TestCase):
     def test_image_request_extracts_prompt(self) -> None:
         self.assertEqual(parse_image_request("Нарисуй кота в космосе"), (True, "кота в космосе"))
         self.assertEqual(
+            parse_image_request("Некит, нарисуй изображение кота"),
+            (True, "кота"),
+        )
+        self.assertEqual(
+            parse_image_request("Никита: нарисуй кота"),
+            (True, "кота"),
+        )
+        self.assertEqual(
             parse_image_request("Сгенерируй изображение: зимний лес"),
             (True, "зимний лес"),
         )
         self.assertEqual(parse_image_request("Расскажи про котов"), (False, "Расскажи про котов"))
+
+    def test_telethon_image_file_is_recognized_as_a_photo(self) -> None:
+        image_file = telethon_image_file(b"\x89PNG\r\n\x1a\n")
+
+        self.assertEqual(image_file.name, "nikita.png")
+        self.assertTrue(telethon_utils.is_image(image_file))
+
+    def test_telethon_voice_file_is_recognized_as_ogg_voice(self) -> None:
+        audio_file = telethon_voice_file(b"OggS" + b"\x00" * 64)
+        attributes, mime_type = telethon_utils.get_attributes(
+            audio_file,
+            voice_note=True,
+        )
+        audio_attribute = next(
+            attribute
+            for attribute in attributes
+            if type(attribute).__name__ == "DocumentAttributeAudio"
+        )
+
+        self.assertEqual(audio_file.name, "nikita.ogg")
+        self.assertEqual(mime_type, "audio/ogg")
+        self.assertTrue(audio_attribute.voice)
 
     def test_history_is_limited_to_recent_messages(self) -> None:
         memory = ConversationMemory(max_messages=2)
@@ -213,6 +262,11 @@ class ConversationMemoryTests(unittest.TestCase):
         self.assertIn(VOICE_REPLY_INSTRUCTION, messages[0]["content"])
         self.assertEqual(messages[1]["content"], "расскажи о Японии")
 
+    def test_persona_encourages_casual_context_aware_replies(self) -> None:
+        self.assertIn("не ставь точку в конце короткого сообщения", SYSTEM_PROMPT)
+        self.assertIn("не выдумывай, кто что просил", SYSTEM_PROMPT)
+        self.assertIn("коротко признай", SYSTEM_PROMPT)
+
     def test_small_talk_uses_short_reply_budget(self) -> None:
         self.assertEqual(get_num_predict([{"role": "user", "content": "Как дела?"}]), 64)
         self.assertEqual(
@@ -230,6 +284,32 @@ class ConversationMemoryTests(unittest.TestCase):
             clean_text_for_speech("1. **Факт** — *текст* и [ссылка](https://example.com)"),
             "Факт — текст и ссылка",
         )
+
+
+class TelethonActionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_action_exit_error_does_not_discard_completed_operation(self) -> None:
+        action_context = AsyncMock()
+        action_context.__aexit__.side_effect = ChatWriteForbiddenError(None)
+        client = Mock()
+        client.action.return_value = action_context
+        operation = AsyncMock(return_value="Ответ")
+
+        result = await run_with_telethon_action(client, 123, "typing", operation)
+
+        self.assertEqual(result, "Ответ")
+        operation.assert_awaited_once()
+
+    async def test_action_entry_error_retries_operation_without_action(self) -> None:
+        action_context = AsyncMock()
+        action_context.__aenter__.side_effect = ChatWriteForbiddenError(None)
+        client = Mock()
+        client.action.return_value = action_context
+        operation = AsyncMock(return_value=b"image")
+
+        result = await run_with_telethon_action(client, 123, "photo", operation)
+
+        self.assertEqual(result, b"image")
+        operation.assert_awaited_once()
 
 
 if __name__ == "__main__":
