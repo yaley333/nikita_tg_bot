@@ -4,9 +4,9 @@ Telegram-бот с характером, локальной языковой м�
 
 README предназначен и для запуска проекта, и для быстрого знакомства с его устройством.
 
-![Скрин мессенджера 1](screens/screen1.jpg)
-![Скрин мессенджера 2](screens/screen2.jpg)
-![Скрин мессенджера 3](screens/screen3.jpg)
+<img src="screens/screen1.jpg" alt="Скрин мессенджера 1" width="300">
+<img src="screens/screen2.jpg" alt="Скрин мессенджера 2" width="300">
+<img src="screens/screen3.jpg" alt="Скрин мессенджера 3" width="300">
 
 ## Возможности
 
