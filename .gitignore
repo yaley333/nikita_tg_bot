@@ -1,0 +1,26 @@
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Telegram authorization sessions
+.sessions/
+*.session
+*.session-journal
+
+# Downloaded models and native binaries
+.models/
+.tools/
+
+# Python environments, caches, and build artifacts
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
