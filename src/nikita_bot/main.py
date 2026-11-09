@@ -366,7 +366,7 @@ async def run_user_session(
                             image_prompt=True,
                         )
                     await model.unload()
-                    async with client.action(chat_id, "upload_photo"):
+                    async with client.action(chat_id, "photo"):
                         image_bytes = await asyncio.to_thread(
                             image_generator.generate,
                             english_prompt,
