@@ -83,24 +83,45 @@ class OllamaClient:
                 "images": [base64.b64encode(image).decode("ascii")],
             }
 
+        num_predict = get_num_predict(history, image_prompt, proactive)
+        options = {
+            "temperature": 0.2 if image_prompt else 0.3 if voice_reply or proactive else 0.8,
+            "num_predict": num_predict,
+        }
+        request_payload: dict[str, object] = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "think": False,
+            "keep_alive": "10m",
+            "options": options,
+        }
         response = await self._http.post(
             f"{self.base_url}/api/chat",
-            json={
-                "model": self.model,
-                "messages": messages,
-                "stream": False,
-                "think": False,
-                "keep_alive": "10m",
-                "options": {
-                    "temperature": 0.2 if image_prompt else 0.3 if voice_reply or proactive else 0.8,
-                    "num_predict": get_num_predict(history, image_prompt, proactive),
-                },
-            },
+            json=request_payload,
         )
         response.raise_for_status()
-        answer = response.json().get("message", {}).get("content", "").strip()
+        result = response.json()
+        answer = result.get("message", {}).get("content", "").strip()
         if not answer:
-            raise ValueError("Модель вернула пустой ответ")
+            retry_options = {
+                **options,
+                "num_predict": min(num_predict * 2, 2048),
+            }
+            retry_payload = {**request_payload, "options": retry_options}
+            response = await self._http.post(
+                f"{self.base_url}/api/chat",
+                json=retry_payload,
+            )
+            response.raise_for_status()
+            result = response.json()
+            answer = result.get("message", {}).get("content", "").strip()
+            if not answer:
+                raise ValueError(
+                    "Модель вернула пустой ответ после повторной попытки "
+                    f"(done_reason={result.get('done_reason', 'unknown')!r}, "
+                    f"eval_count={result.get('eval_count', 'unknown')!r})"
+                )
         return answer
 
     async def unload(self) -> None:

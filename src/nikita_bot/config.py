@@ -65,5 +65,5 @@ class Settings:
             proactive_group_min_messages=max(
                 1, int(os.getenv("PROACTIVE_GROUP_MIN_MESSAGES", "5"))
             ),
-            max_history_messages=max(2, int(os.getenv("MAX_HISTORY_MESSAGES", "16"))),
+            max_history_messages=max(2, int(os.getenv("MAX_HISTORY_MESSAGES", "64"))),
         )

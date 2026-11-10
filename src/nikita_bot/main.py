@@ -28,6 +28,8 @@ from .initiative import GroupInitiative, proactive_reply_is_relevant
 from .imagegen import StableDiffusionCpp
 from .memory import ConversationMemory
 from .model import OllamaClient
+from .responses import LatestMessageCoordinator
+from .routing import KnownBotNames
 from .speech import PiperSpeaker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -100,6 +102,8 @@ async def run_bot_api(
     bot_user = await bot.get_me()
     await sticker_library.load_bot_api(bot)
     logger.info("Nikita запущен через Bot API (id=%s)", bot_user.id)
+    responses = LatestMessageCoordinator()
+    known_bots = KnownBotNames()
 
     @dispatcher.message()
     async def handle_bot_message(message: Message) -> None:
@@ -109,6 +113,37 @@ async def run_bot_api(
         text = (message.text or message.caption or "").strip()
         is_group = message.chat.type in {"group", "supergroup"}
         sender = message.from_user
+        sender_is_bot = bool(sender and sender.is_bot)
+        if is_group and sender_is_bot and not settings.allow_bot_senders:
+            return
+        known_bots.observe(message.chat.id, sender)
+        addressed_to_other_bot = is_group and known_bots.addresses_other_bot(
+            message.chat.id,
+            text,
+        )
+        should_reply = not addressed_to_other_bot and (
+            not is_group
+            or should_respond_to_group_message(
+                sender_is_bot,
+                settings.allow_bot_senders,
+                settings.group_reply_probability,
+                random.random(),
+            )
+        )
+        if should_reply:
+            responses.observe(message.chat.id, message.message_id)
+        incoming_text = text or (
+            "[изображение]"
+            if message.photo
+            else "[стикер]"
+            if message.sticker
+            else "[сообщение без текста]"
+        )
+        memory.add(
+            message.chat.id,
+            "user",
+            format_sender_context(sender, incoming_text) if is_group else incoming_text,
+        )
         sticker_image = None
         if message.sticker:
             sticker_image, sticker_hint = await download_bot_sticker_preview(
@@ -116,42 +151,40 @@ async def run_bot_api(
                 message.sticker,
             )
             text = text or sticker_hint
-        if is_group and sender and sender.is_bot and not settings.allow_bot_senders:
-            return
-        sender_is_bot = bool(sender and sender.is_bot)
         if (
             is_group
+            and not addressed_to_other_bot
             and settings.proactive_group_enabled
             and not sticker_image
             and initiative.should_initiate(message.chat.id, sender_is_bot=sender_is_bot)
         ):
+            responses.observe(message.chat.id, message.message_id)
             try:
-                proactive = await create_proactive_group_output(
-                    message.chat.id,
-                    sender,
-                    text,
-                    model,
-                    memory,
-                    speaker,
-                    image_generator,
-                )
-                if proactive:
-                    await send_bot_proactive(bot, message.chat.id, proactive)
-                    await apply_bot_group_actions(bot, sticker_library, message, text)
-                    return
+                async with responses.lock_for(message.chat.id):
+                    if not responses.is_latest(message.chat.id, message.message_id):
+                        return
+                    proactive = await create_proactive_group_output(
+                        message.chat.id,
+                        model,
+                        memory,
+                        speaker,
+                        image_generator,
+                    )
+                    if proactive:
+                        if not responses.is_latest(message.chat.id, message.message_id):
+                            return
+                        await send_bot_proactive(bot, message.chat.id, proactive)
+                        memory.add(
+                            message.chat.id,
+                            "assistant",
+                            proactive_memory_content(proactive),
+                        )
+                        if responses.is_latest(message.chat.id, message.message_id):
+                            await apply_bot_group_actions(bot, sticker_library, message, text)
+                        return
             except Exception:
                 logger.exception("Не удалось отправить инициативное сообщение")
-        if is_group and not should_respond_to_group_message(
-            sender_is_bot,
-            settings.allow_bot_senders,
-            settings.group_reply_probability,
-            random.random(),
-        ):
-            memory.add(
-                message.chat.id,
-                "user",
-                format_sender_context(sender, text or "[изображение]"),
-            )
+        if is_group and not should_reply:
             await apply_bot_group_actions(bot, sticker_library, message, text)
             return
 
@@ -160,37 +193,43 @@ async def run_bot_api(
             if not image_prompt:
                 await message.answer("Опиши, что именно нарисовать.")
                 return
-            try:
-                await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-                english_prompt = await model.generate(
-                    [{"role": "user", "content": image_prompt}],
-                    image_prompt=True,
-                )
-                await model.unload()
-                await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-                image_bytes = await asyncio.to_thread(image_generator.generate, english_prompt)
-                memory.add(
+            async with responses.lock_for(message.chat.id):
+                if not responses.should_process(
                     message.chat.id,
-                    "user",
-                    format_sender_context(sender, text) if is_group else text,
-                )
-                memory.add(message.chat.id, "assistant", "Создал изображение.")
-                await bot.send_photo(
-                    message.chat.id,
-                    BufferedInputFile(image_bytes, filename="nikita.png"),
-                    caption="Готово.",
-                )
-                if is_group:
-                    await apply_bot_group_actions(bot, sticker_library, message, text)
-            except Exception:
-                logger.exception("Не удалось сгенерировать изображение")
-                await message.answer("Не получилось создать изображение. Подробности смотри в PowerShell.")
+                    message.message_id,
+                    preserve=True,
+                ):
+                    return
+                try:
+                    await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+                    english_prompt = await model.generate(
+                        [{"role": "user", "content": image_prompt}],
+                        image_prompt=True,
+                    )
+                    await model.unload()
+                    image_bytes = await asyncio.to_thread(
+                        image_generator.generate,
+                        english_prompt,
+                    )
+                    await bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
+                    await bot.send_photo(
+                        message.chat.id,
+                        BufferedInputFile(image_bytes, filename="nikita.png"),
+                        caption="Готово.",
+                    )
+                    memory.add(message.chat.id, "assistant", "Создал изображение.")
+                    if is_group:
+                        await apply_bot_group_actions(bot, sticker_library, message, text)
+                except Exception:
+                    logger.exception("Не удалось сгенерировать изображение")
+                    await message.answer("Не получилось создать изображение. Подробности смотри в PowerShell.")
             return
 
         voice_requested, text = parse_voice_command(text)
         voice_requested = voice_requested or wants_voice_reply(text)
         if voice_requested and not text:
-            await message.answer("Напиши текст после команды: /voice что-нибудь расскажи")
+            if responses.is_latest(message.chat.id, message.message_id):
+                await message.answer("Напиши текст после команды: /voice что-нибудь расскажи")
             return
         image = None
         if message.photo:
@@ -203,29 +242,33 @@ async def run_bot_api(
         elif not text:
             return
 
-        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-        answer = await generate_answer(
-            message.chat.id,
-            format_sender_context(sender, text) if is_group else text,
-            image,
-            model,
-            memory,
-            voice_reply=voice_requested,
-        )
-        if voice_requested:
-            try:
-                await bot.send_chat_action(message.chat.id, ChatAction.RECORD_VOICE)
-                audio = await asyncio.to_thread(speaker.synthesize_ogg, answer)
-                await bot.send_voice(
-                    message.chat.id,
-                    BufferedInputFile(audio, filename="nikita.ogg"),
-                )
-            except Exception:
-                logger.exception("Не удалось создать голосовой ответ")
-                await message.answer("Не получилось создать голосовой ответ. Проверь Piper.")
-        else:
-            await message.answer(answer)
-        if is_group:
+        async with responses.lock_for(message.chat.id):
+            if not responses.is_latest(message.chat.id, message.message_id):
+                return
+            await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+            answer = await generate_answer(
+                message.chat.id,
+                image,
+                model,
+                memory,
+                voice_reply=voice_requested,
+            )
+            if voice_requested:
+                try:
+                    await bot.send_chat_action(message.chat.id, ChatAction.RECORD_VOICE)
+                    audio = await asyncio.to_thread(speaker.synthesize_ogg, answer)
+                    memory.add(message.chat.id, "assistant", answer)
+                    await bot.send_voice(
+                        message.chat.id,
+                        BufferedInputFile(audio, filename="nikita.ogg"),
+                    )
+                except Exception:
+                    logger.exception("Не удалось создать голосовой ответ")
+                    await message.answer("Не получилось создать голосовой ответ. Проверь Piper.")
+            else:
+                memory.add(message.chat.id, "assistant", answer)
+                await message.answer(answer)
+        if is_group and responses.is_latest(message.chat.id, message.message_id):
             await apply_bot_group_actions(bot, sticker_library, message, text)
 
     try:
@@ -284,6 +327,8 @@ async def run_user_session(
             me.username or "нет",
         )
         await sticker_library.load_telethon(client)
+        responses = LatestMessageCoordinator()
+        known_bots = KnownBotNames()
 
         @client.on(events.NewMessage(incoming=True))
         async def handle_user_message(event: events.NewMessage.Event) -> None:
@@ -296,6 +341,40 @@ async def run_user_session(
             raw_text = (event.raw_text or "").strip()
             if sender_is_bot and not settings.allow_bot_senders:
                 return
+            known_bots.observe(chat_id, sender)
+            addressed_to_other_bot = event.is_group and known_bots.addresses_other_bot(
+                chat_id,
+                raw_text,
+            )
+            should_reply = not addressed_to_other_bot and (
+                should_respond_to_group_message(
+                    sender_is_bot,
+                    settings.allow_bot_senders,
+                    settings.group_reply_probability,
+                    random.random(),
+                )
+                if event.is_group
+                else await should_respond(event)
+            )
+            if should_reply:
+                responses.observe(chat_id, event.message.id)
+            incoming_text = raw_text or (
+                "[изображение]"
+                if event.message.photo
+                else "[стикер]"
+                if event.message.sticker
+                else "[сообщение без текста]"
+            )
+            memory.add(
+                chat_id,
+                "user",
+                format_sender_context(
+                    sender,
+                    incoming_text,
+                )
+                if event.is_group or sender_is_bot
+                else incoming_text,
+            )
             sticker_image = None
             sticker_hint = ""
             if event.message.sticker:
@@ -304,44 +383,45 @@ async def run_user_session(
 
             if (
                 event.is_group
+                and not addressed_to_other_bot
                 and settings.proactive_group_enabled
                 and not sticker_image
                 and initiative.should_initiate(chat_id, sender_is_bot=sender_is_bot)
             ):
+                responses.observe(chat_id, event.message.id)
                 try:
-                    proactive = await create_proactive_group_output(
-                        chat_id,
-                        sender,
-                        raw_text,
-                        model,
-                        memory,
-                        speaker,
-                        image_generator,
-                    )
-                    if proactive:
-                        await send_telethon_proactive(client, chat_id, proactive)
-                        await apply_telethon_group_actions(
-                            client,
-                            sticker_library,
-                            event,
-                            raw_text,
+                    async with responses.lock_for(chat_id):
+                        if not responses.is_latest(chat_id, event.message.id):
+                            return
+                        proactive = await create_proactive_group_output(
+                            chat_id,
+                            model,
+                            memory,
+                            speaker,
+                            image_generator,
                         )
-                        return
+                        if proactive:
+                            if not responses.is_latest(chat_id, event.message.id):
+                                return
+                            await send_telethon_proactive(client, chat_id, proactive)
+                            memory.add(
+                                chat_id,
+                                "assistant",
+                                proactive_memory_content(proactive),
+                            )
+                            if responses.is_latest(chat_id, event.message.id):
+                                await apply_telethon_group_actions(
+                                    client,
+                                    sticker_library,
+                                    event,
+                                    raw_text,
+                                )
+                            return
                 except Exception:
                     logger.exception("Не удалось отправить инициативное сообщение")
 
             if event.is_group:
-                if not should_respond_to_group_message(
-                    sender_is_bot,
-                    settings.allow_bot_senders,
-                    settings.group_reply_probability,
-                    random.random(),
-                ):
-                    memory.add(
-                        chat_id,
-                        "user",
-                        format_sender_context(sender, raw_text or "[изображение]"),
-                    )
+                if not should_reply:
                     await apply_telethon_group_actions(
                         client,
                         sticker_library,
@@ -349,7 +429,7 @@ async def run_user_session(
                         raw_text,
                     )
                     return
-            elif not await should_respond(event):
+            elif not should_reply:
                 return
 
             text = raw_text
@@ -361,54 +441,57 @@ async def run_user_session(
                 chat_id = event.chat_id
                 if chat_id is None:
                     return
-                try:
-                    async with client.action(chat_id, "typing"):
-                        english_prompt = await model.generate(
-                            [{"role": "user", "content": image_prompt}],
-                            image_prompt=True,
-                        )
-                    await model.unload()
-                    image_bytes = await run_with_telethon_action(
-                        client,
+                async with responses.lock_for(chat_id):
+                    if not responses.should_process(
                         chat_id,
-                        "photo",
-                        lambda: asyncio.to_thread(
-                            image_generator.generate,
-                            english_prompt,
-                        ),
-                    )
-                    memory.add(
-                        chat_id,
-                        "user",
-                        format_sender_context(sender, text) if event.is_group else text,
-                    )
-                    memory.add(chat_id, "assistant", "Создал изображение.")
-                    await client.send_file(
-                        chat_id,
-                        telethon_image_file(image_bytes),
-                        force_document=False,
-                        caption="Готово.",
-                        reply_to=event.message.id,
-                    )
-                    if event.is_group:
-                        await apply_telethon_group_actions(
+                        event.message.id,
+                        preserve=True,
+                    ):
+                        return
+                    try:
+                        async with client.action(chat_id, "typing"):
+                            english_prompt = await model.generate(
+                                [{"role": "user", "content": image_prompt}],
+                                image_prompt=True,
+                            )
+                        await model.unload()
+                        image_bytes = await run_with_telethon_action(
                             client,
-                            sticker_library,
-                            event,
-                            text,
+                            chat_id,
+                            "photo",
+                            lambda: asyncio.to_thread(
+                                image_generator.generate,
+                                english_prompt,
+                            ),
                         )
-                except Exception:
-                    logger.exception("Не удалось сгенерировать изображение")
-                    await event.reply(
-                        "Не получилось создать изображение. Подробности смотри в PowerShell.",
-                        parse_mode=None,
-                    )
+                        await client.send_file(
+                            chat_id,
+                            telethon_image_file(image_bytes),
+                            force_document=False,
+                            caption="Готово.",
+                            reply_to=event.message.id,
+                        )
+                        memory.add(chat_id, "assistant", "Создал изображение.")
+                        if event.is_group:
+                            await apply_telethon_group_actions(
+                                client,
+                                sticker_library,
+                                event,
+                                text,
+                            )
+                    except Exception:
+                        logger.exception("Не удалось сгенерировать изображение")
+                        await event.reply(
+                            "Не получилось создать изображение. Подробности смотри в PowerShell.",
+                            parse_mode=None,
+                        )
                 return
 
             voice_requested, text = parse_voice_command(text)
             voice_requested = voice_requested or wants_voice_reply(text)
             if voice_requested and not text:
-                await event.reply("Напиши текст после команды: /voice что-нибудь расскажи")
+                if responses.is_latest(chat_id, event.message.id):
+                    await event.reply("Напиши текст после команды: /voice что-нибудь расскажи")
                 return
 
             image = None
@@ -422,39 +505,41 @@ async def run_user_session(
             elif not text:
                 return
 
-            answer = await run_with_telethon_action(
-                client,
-                chat_id,
-                "typing",
-                lambda: generate_answer(
+            async with responses.lock_for(chat_id):
+                if not responses.is_latest(chat_id, event.message.id):
+                    return
+                answer = await run_with_telethon_action(
+                    client,
                     chat_id,
-                    format_sender_context(sender, text)
-                    if event.is_group or sender_is_bot
-                    else text,
-                    image,
-                    model,
-                    memory,
-                    voice_reply=voice_requested,
-                ),
-            )
-            if voice_requested:
-                try:
-                    audio = await asyncio.to_thread(speaker.synthesize_ogg, answer)
-                    await client.send_file(
+                    "typing",
+                    lambda: generate_answer(
                         chat_id,
-                        telethon_voice_file(audio),
-                        voice_note=True,
-                        reply_to=event.message.id,
-                    )
-                except Exception:
-                    logger.exception("Не удалось создать голосовой ответ")
-                    await event.reply(
-                        "Не получилось создать голосовой ответ. Проверь Piper.",
-                        parse_mode=None,
-                    )
-            else:
-                await event.reply(answer, parse_mode=None)
-            if event.is_group:
+                        image,
+                        model,
+                        memory,
+                        voice_reply=voice_requested,
+                    ),
+                )
+                if voice_requested:
+                    try:
+                        audio = await asyncio.to_thread(speaker.synthesize_ogg, answer)
+                        memory.add(chat_id, "assistant", answer)
+                        await client.send_file(
+                            chat_id,
+                            telethon_voice_file(audio),
+                            voice_note=True,
+                            reply_to=event.message.id,
+                        )
+                    except Exception:
+                        logger.exception("Не удалось создать голосовой ответ")
+                        await event.reply(
+                            "Не получилось создать голосовой ответ. Проверь Piper.",
+                            parse_mode=None,
+                        )
+                else:
+                    memory.add(chat_id, "assistant", answer)
+                    await event.reply(answer, parse_mode=None)
+            if event.is_group and responses.is_latest(chat_id, event.message.id):
                 await apply_telethon_group_actions(
                     client,
                     sticker_library,
@@ -531,15 +616,12 @@ async def apply_telethon_group_actions(
 
 async def create_proactive_group_output(
     chat_id: int,
-    sender: object,
-    text: str,
     model: OllamaClient,
     memory: ConversationMemory,
     speaker: PiperSpeaker,
     image_generator: StableDiffusionCpp,
 ) -> tuple[str, bytes | str, str] | None:
-    user_context = format_sender_context(sender, text or "[сообщение в группе]")
-    history = [*memory.history(chat_id), {"role": "user", "content": user_context}]
+    history = memory.history(chat_id)
     media_choice = random.random()
 
     if media_choice < 0.05:
@@ -548,17 +630,13 @@ async def create_proactive_group_output(
             return None
         await model.unload()
         image = await asyncio.to_thread(image_generator.generate, prompt)
-        memory.add(chat_id, "user", user_context)
-        memory.add(chat_id, "assistant", "[самостоятельно отправил картинку]")
-        return "image", image, ""
+        return "image", image, "[самостоятельно отправил картинку]"
 
     voice = media_choice < 0.20
     answer = await model.generate(history, voice_reply=voice, proactive=True)
     recent_context = " ".join(message["content"] for message in history[-8:])
     if answer.strip() == "[SKIP]" or not proactive_reply_is_relevant(answer, recent_context):
         return None
-    memory.add(chat_id, "user", user_context)
-    memory.add(chat_id, "assistant", answer)
     if voice:
         audio = await asyncio.to_thread(speaker.synthesize_ogg, answer)
         return "voice", audio, answer
@@ -606,19 +684,23 @@ async def send_telethon_proactive(
 
 async def generate_answer(
     chat_id: int,
-    text: str,
     image: bytes | None,
     model: OllamaClient,
     memory: ConversationMemory,
     voice_reply: bool = False,
 ) -> str:
-    memory.add(chat_id, "user", text)
     try:
         answer = await model.generate(memory.history(chat_id), image, voice_reply)
     except Exception:
         logger.exception("Не удалось обработать сообщение")
         answer = "Не удалось получить ответ от модели. Подробности ошибки смотри в окне PowerShell."
-    memory.add(chat_id, "assistant", answer)
+    return answer
+
+
+def proactive_memory_content(
+    proactive: tuple[str, bytes | str, str],
+) -> str:
+    _, _, answer = proactive
     return answer
 
 
