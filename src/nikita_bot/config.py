@@ -38,8 +38,8 @@ class Settings:
             api_id=os.getenv("API_ID", "").strip() or None,
             api_hash=os.getenv("API_HASH", "").strip() or None,
             session_path=os.getenv("TELEGRAM_SESSION_PATH", ".sessions/nikita_user"),
-            ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/"),
-            ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:4b"),
+            ollama_url=os.getenv("OLLAMA_URL", "http://localhost:11434").strip().rstrip("/"),
+            ollama_model=os.getenv("OLLAMA_MODEL", "qwen3.5:4b").strip(),
             piper_voice_path=os.getenv(
                 "PIPER_VOICE_PATH", ".models/piper/ru_RU-ruslan-medium.onnx"
             ),

@@ -3,9 +3,9 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nikita-telegram-bot"
+name = "asya-telegram-bot"
 version = "0.1.0"
-description = "Telegram character bot powered by a local Ollama model"
+description = "Telegram character bot powered by Ollama and Qwen"
 requires-python = ">=3.11"
 dynamic = ["dependencies"]
 

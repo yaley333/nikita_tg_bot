@@ -34,7 +34,7 @@ from .speech import PiperSpeaker
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
-ActionResult = TypeVar("ActionResult", str, bytes)
+ActionResult = TypeVar("ActionResult")
 VOICE_REQUEST_PATTERN = re.compile(
     r"\b(?:ответь|скажи|пришли|отправь|скинь|запиши|озвучь|прочитай)\b"
     r".{0,40}\b(?:голосом|голосовое(?:\s+сообщение)?|голосовым(?:\s+сообщением)?|гс)\b"
@@ -101,7 +101,7 @@ async def run_bot_api(
     dispatcher = Dispatcher()
     bot_user = await bot.get_me()
     await sticker_library.load_bot_api(bot)
-    logger.info("Nikita запущен через Bot API (id=%s)", bot_user.id)
+    logger.info("Ася запущена через Bot API (id=%s)", bot_user.id)
     responses = LatestMessageCoordinator()
     known_bots = KnownBotNames()
 
@@ -121,14 +121,12 @@ async def run_bot_api(
             message.chat.id,
             text,
         )
-        should_reply = not addressed_to_other_bot and (
-            not is_group
-            or should_respond_to_group_message(
-                sender_is_bot,
-                settings.allow_bot_senders,
-                settings.group_reply_probability,
-                random.random(),
-            )
+        should_reply = not is_group or should_respond_to_group_message(
+            sender_is_bot,
+            settings.allow_bot_senders,
+            settings.group_reply_probability,
+            random.random(),
+            addressed_to_other_bot=addressed_to_other_bot,
         )
         if should_reply:
             responses.observe(message.chat.id, message.message_id)
@@ -206,7 +204,6 @@ async def run_bot_api(
                         [{"role": "user", "content": image_prompt}],
                         image_prompt=True,
                     )
-                    await model.unload()
                     image_bytes = await asyncio.to_thread(
                         image_generator.generate,
                         english_prompt,
@@ -222,7 +219,6 @@ async def run_bot_api(
                         await apply_bot_group_actions(bot, sticker_library, message, text)
                 except Exception:
                     logger.exception("Не удалось сгенерировать изображение")
-                    await message.answer("Не получилось создать изображение. Подробности смотри в PowerShell.")
             return
 
         voice_requested, text = parse_voice_command(text)
@@ -253,18 +249,19 @@ async def run_bot_api(
                 memory,
                 voice_reply=voice_requested,
             )
+            if answer is None:
+                return
             if voice_requested:
                 try:
                     await bot.send_chat_action(message.chat.id, ChatAction.RECORD_VOICE)
                     audio = await asyncio.to_thread(speaker.synthesize_ogg, answer)
-                    memory.add(message.chat.id, "assistant", answer)
                     await bot.send_voice(
                         message.chat.id,
                         BufferedInputFile(audio, filename="nikita.ogg"),
                     )
+                    memory.add(message.chat.id, "assistant", answer)
                 except Exception:
                     logger.exception("Не удалось создать голосовой ответ")
-                    await message.answer("Не получилось создать голосовой ответ. Проверь Piper.")
             else:
                 memory.add(message.chat.id, "assistant", answer)
                 await message.answer(answer)
@@ -322,7 +319,7 @@ async def run_user_session(
 
         me = await client.get_me()
         logger.info(
-            "Nikita запущен через пользовательскую сессию (id=%s, username=@%s)",
+            "Ася запущена через пользовательскую сессию (id=%s, username=@%s)",
             me.id,
             me.username or "нет",
         )
@@ -346,12 +343,13 @@ async def run_user_session(
                 chat_id,
                 raw_text,
             )
-            should_reply = not addressed_to_other_bot and (
+            should_reply = (
                 should_respond_to_group_message(
                     sender_is_bot,
                     settings.allow_bot_senders,
                     settings.group_reply_probability,
                     random.random(),
+                    addressed_to_other_bot=addressed_to_other_bot,
                 )
                 if event.is_group
                 else await should_respond(event)
@@ -449,12 +447,15 @@ async def run_user_session(
                     ):
                         return
                     try:
-                        async with client.action(chat_id, "typing"):
-                            english_prompt = await model.generate(
+                        english_prompt = await run_with_telethon_action(
+                            client,
+                            chat_id,
+                            "typing",
+                            lambda: model.generate(
                                 [{"role": "user", "content": image_prompt}],
                                 image_prompt=True,
-                            )
-                        await model.unload()
+                            ),
+                        )
                         image_bytes = await run_with_telethon_action(
                             client,
                             chat_id,
@@ -481,10 +482,6 @@ async def run_user_session(
                             )
                     except Exception:
                         logger.exception("Не удалось сгенерировать изображение")
-                        await event.reply(
-                            "Не получилось создать изображение. Подробности смотри в PowerShell.",
-                            parse_mode=None,
-                        )
                 return
 
             voice_requested, text = parse_voice_command(text)
@@ -520,22 +517,20 @@ async def run_user_session(
                         voice_reply=voice_requested,
                     ),
                 )
+                if answer is None:
+                    return
                 if voice_requested:
                     try:
                         audio = await asyncio.to_thread(speaker.synthesize_ogg, answer)
-                        memory.add(chat_id, "assistant", answer)
                         await client.send_file(
                             chat_id,
                             telethon_voice_file(audio),
                             voice_note=True,
                             reply_to=event.message.id,
                         )
+                        memory.add(chat_id, "assistant", answer)
                     except Exception:
                         logger.exception("Не удалось создать голосовой ответ")
-                        await event.reply(
-                            "Не получилось создать голосовой ответ. Проверь Piper.",
-                            parse_mode=None,
-                        )
                 else:
                     memory.add(chat_id, "assistant", answer)
                     await event.reply(answer, parse_mode=None)
@@ -565,8 +560,12 @@ def should_respond_to_group_message(
     allow_bot_senders: bool,
     reply_probability: float,
     random_value: float,
+    *,
+    addressed_to_other_bot: bool = False,
 ) -> bool:
     if sender_is_bot and not allow_bot_senders:
+        return False
+    if addressed_to_other_bot and not sender_is_bot:
         return False
     return random_value < reply_probability
 
@@ -628,7 +627,6 @@ async def create_proactive_group_output(
         prompt = await model.generate(history, image_prompt=True, proactive=True)
         if prompt.strip() == "[SKIP]":
             return None
-        await model.unload()
         image = await asyncio.to_thread(image_generator.generate, prompt)
         return "image", image, "[самостоятельно отправил картинку]"
 
@@ -688,12 +686,12 @@ async def generate_answer(
     model: OllamaClient,
     memory: ConversationMemory,
     voice_reply: bool = False,
-) -> str:
+) -> str | None:
     try:
         answer = await model.generate(memory.history(chat_id), image, voice_reply)
     except Exception:
         logger.exception("Не удалось обработать сообщение")
-        answer = "Не удалось получить ответ от модели. Подробности ошибки смотри в окне PowerShell."
+        return None
     return answer
 
 
@@ -710,16 +708,35 @@ async def run_with_telethon_action(
     action: str,
     operation: Callable[[], Awaitable[ActionResult]],
 ) -> ActionResult:
-    result: ActionResult | None = None
+    action_context = client.action(chat_id, action, auto_cancel=False)
     try:
-        async with client.action(chat_id, action):
-            result = await operation()
+        await action_context.__aenter__()
     except ChatWriteForbiddenError:
         logger.info("Не удалось показать действие %r в чате %s", action, chat_id)
-        if result is None:
-            return await operation()
+        return await operation()
 
-    assert result is not None
+    try:
+        result = await operation()
+    except BaseException as operation_error:
+        try:
+            await action_context.__aexit__(
+                type(operation_error),
+                operation_error,
+                operation_error.__traceback__,
+            )
+        except (ChatWriteForbiddenError, ConnectionError):
+            logger.debug(
+                "Не удалось завершить действие %r в чате %s",
+                action,
+                chat_id,
+                exc_info=True,
+            )
+        raise
+
+    try:
+        await action_context.__aexit__(None, None, None)
+    except ChatWriteForbiddenError:
+        logger.info("Не удалось завершить действие %r в чате %s", action, chat_id)
     return result
 
 
@@ -761,7 +778,7 @@ def wants_voice_reply(text: str) -> bool:
 
 
 IMAGE_REQUEST_PATTERN = re.compile(
-    r"^\s*(?:(?:никита|никит|некит)\b\s*[,!:—-]?\s*)?"
+    r"^\s*(?:(?:ас[яю]|asya)\b\s*[,!:—-]?\s*)?"
     r"(?:нарисуй|сгенерируй|создай|сделай)\s+"
     r"(?:(?:мне|пожалуйста)\s+)*"
     r"(?:(?:картинку|изображение|иллюстрацию|арт|фото)\b\s*)?"

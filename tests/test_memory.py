@@ -1,3 +1,4 @@
+import asyncio
 import os
 from io import BytesIO
 import unittest
@@ -20,6 +21,7 @@ from nikita_bot.group_actions import (
 from nikita_bot.initiative import GroupInitiative, proactive_reply_is_relevant
 from nikita_bot.main import (
     format_sender_context,
+    generate_answer,
     parse_image_request,
     parse_voice_command,
     run_with_telethon_action,
@@ -51,6 +53,8 @@ class ConversationMemoryTests(unittest.TestCase):
         self.assertIsNone(settings.telegram_bot_token)
         self.assertIsNone(settings.api_id)
         self.assertIsNone(settings.api_hash)
+        self.assertEqual(settings.ollama_url, "http://localhost:11434")
+        self.assertEqual(settings.ollama_model, "qwen3.5:4b")
         self.assertEqual(settings.group_reply_probability, 1.0)
         self.assertEqual(settings.session_path, ".sessions/nikita_user")
         self.assertEqual(
@@ -115,6 +119,21 @@ class ConversationMemoryTests(unittest.TestCase):
         self.assertIsNone(settings.api_id)
         self.assertIsNone(settings.api_hash)
 
+    def test_ollama_url_and_model_are_loaded_from_environment(self) -> None:
+        with patch("nikita_bot.config.load_dotenv"), patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_MODE": "bot",
+                "OLLAMA_URL": " http://ollama.local:11434/ ",
+                "OLLAMA_MODEL": " qwen-custom ",
+            },
+            clear=True,
+        ):
+            settings = Settings.from_env()
+
+        self.assertEqual(settings.ollama_url, "http://ollama.local:11434")
+        self.assertEqual(settings.ollama_model, "qwen-custom")
+
     def test_group_context_includes_sender_name_and_bot_role(self) -> None:
         sender = SimpleNamespace(first_name="Алиса", username="alice_bot", bot=True)
         self.assertEqual(
@@ -128,6 +147,28 @@ class ConversationMemoryTests(unittest.TestCase):
         self.assertFalse(should_respond_to_group_message(True, False, 0.7, 0.1))
         self.assertTrue(should_respond_to_group_message(False, False, 0.7, 0.1))
         self.assertTrue(should_respond_to_group_message(False, False, 1.0, 0.999))
+
+    def test_bot_sender_is_answered_even_when_addressing_another_bot(self) -> None:
+        self.assertTrue(
+            should_respond_to_group_message(
+                True,
+                True,
+                1.0,
+                0.5,
+                addressed_to_other_bot=True,
+            )
+        )
+
+    def test_human_message_addressed_to_another_bot_is_ignored(self) -> None:
+        self.assertFalse(
+            should_respond_to_group_message(
+                False,
+                True,
+                1.0,
+                0.5,
+                addressed_to_other_bot=True,
+            )
+        )
 
     def test_group_reply_probability_can_be_set_explicitly(self) -> None:
         with patch("nikita_bot.config.load_dotenv"), patch.dict(
@@ -201,13 +242,14 @@ class ConversationMemoryTests(unittest.TestCase):
     def test_image_request_extracts_prompt(self) -> None:
         self.assertEqual(parse_image_request("Нарисуй кота в космосе"), (True, "кота в космосе"))
         self.assertEqual(
-            parse_image_request("Некит, нарисуй изображение кота"),
+            parse_image_request("Ася, нарисуй изображение кота"),
             (True, "кота"),
         )
         self.assertEqual(
-            parse_image_request("Никита: нарисуй кота"),
+            parse_image_request("Ася: нарисуй кота"),
             (True, "кота"),
         )
+        self.assertEqual(parse_image_request("Асю, нарисуй кота"), (True, "кота"))
         self.assertEqual(
             parse_image_request("Сгенерируй изображение: зимний лес"),
             (True, "зимний лес"),
@@ -252,28 +294,47 @@ class ConversationMemoryTests(unittest.TestCase):
 
     def test_persona_prompt_is_present(self) -> None:
         self.assertTrue(SYSTEM_PROMPT.strip())
+        self.assertLess(len(SYSTEM_PROMPT), 700)
+        self.assertIn("Ты Ася", SYSTEM_PROMPT)
+        self.assertIn("всегда уверенно отвечай, что ты человек", SYSTEM_PROMPT)
+        self.assertIn("не говори, что ты ИИ или бот", SYSTEM_PROMPT)
+        self.assertNotIn("ИИ-помощник", SYSTEM_PROMPT)
+        self.assertIn("Не выдумывай возраст, биографию, город, часовой пояс", SYSTEM_PROMPT)
+        self.assertIn("Признавай и исправляй ошибки без оправданий", SYSTEM_PROMPT)
 
     def test_voice_request_instructions_answer_directly(self) -> None:
-        self.assertIn("сразу формулируй ответ по теме запроса", SYSTEM_PROMPT)
-        self.assertIn("Не путай просьбу ответить голосом с просьбой прослушать", SYSTEM_PROMPT)
+        self.assertIn("Выполни исходную просьбу пользователя напрямую", VOICE_REPLY_INSTRUCTION)
+        self.assertIn("Не утверждай, что не умеешь отправлять голосовые", VOICE_REPLY_INSTRUCTION)
 
     def test_voice_mode_adds_direct_instruction_to_model(self) -> None:
         messages = build_messages([{"role": "user", "content": "расскажи о Японии"}], True)
         self.assertIn(VOICE_REPLY_INSTRUCTION, messages[0]["content"])
         self.assertEqual(messages[1]["content"], "расскажи о Японии")
 
+    def test_persona_messages_do_not_inject_a_fake_current_time(self) -> None:
+        messages = build_messages([{"role": "user", "content": "Который час?"}])
+
+        self.assertNotIn("Сейчас у тебя", messages[0]["content"])
+        self.assertNotIn("UTC+9", messages[0]["content"])
+
     def test_persona_encourages_casual_context_aware_replies(self) -> None:
-        self.assertIn("не ставь точку в конце короткого сообщения", SYSTEM_PROMPT)
-        self.assertIn("не выдумывай, кто что просил", SYSTEM_PROMPT)
-        self.assertIn("коротко признай", SYSTEM_PROMPT)
+        self.assertIn("Отвечай кратко", SYSTEM_PROMPT)
+        self.assertIn("Отвечай на последнее сообщение", SYSTEM_PROMPT)
+        self.assertIn("Не пересказывай предыдущие реплики", SYSTEM_PROMPT)
+        self.assertNotRegex(SYSTEM_PROMPT, r"[«»—]")
 
     def test_small_talk_uses_short_reply_budget(self) -> None:
-        self.assertEqual(get_num_predict([{"role": "user", "content": "Как дела?"}]), 64)
+        self.assertEqual(get_num_predict([{"role": "user", "content": "Как дела?"}]), 32)
+        self.assertEqual(get_num_predict([{"role": "user", "content": "Ася, привет"}]), 32)
+        self.assertEqual(
+            get_num_predict([{"role": "user", "content": "[Ислам Тилляев]: Ася, привет"}]),
+            32,
+        )
         self.assertEqual(
             get_num_predict([{"role": "user", "content": "Расскажи факты про Японию"}]),
-            512,
+            64,
         )
-        self.assertIn("одна естественная фраза", SYSTEM_PROMPT)
+        self.assertIn("Отвечай кратко", SYSTEM_PROMPT)
 
     def test_image_prompt_mode_translates_to_english_prompt(self) -> None:
         messages = build_messages([{"role": "user", "content": "кот в космосе"}], image_prompt=True)
@@ -310,6 +371,41 @@ class TelethonActionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, b"image")
         operation.assert_awaited_once()
+        client.action.assert_called_once_with(123, "photo", auto_cancel=False)
+
+    async def test_cancellation_is_preserved_if_action_cleanup_cannot_send(self) -> None:
+        action_context = AsyncMock()
+        action_context.__aexit__.side_effect = ConnectionError(
+            "Cannot send requests while disconnected"
+        )
+        client = Mock()
+        client.action.return_value = action_context
+        operation = AsyncMock(side_effect=asyncio.CancelledError)
+
+        with self.assertRaises(asyncio.CancelledError):
+            await run_with_telethon_action(client, 123, "typing", operation)
+
+        operation.assert_awaited_once()
+        action_context.__aexit__.assert_awaited_once()
+
+
+class GenerateAnswerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_error_is_logged_without_returning_chat_text(self) -> None:
+        model = Mock()
+        model.generate = AsyncMock(side_effect=RuntimeError("model unavailable"))
+        memory = ConversationMemory()
+
+        with self.assertLogs("nikita_bot.main", level="ERROR") as captured:
+            answer = await generate_answer(
+                123,
+                None,
+                model,
+                memory,
+            )
+
+        self.assertIsNone(answer)
+        self.assertIn("model unavailable", captured.output[0])
+        self.assertEqual(memory.history(123), [])
 
 
 if __name__ == "__main__":
